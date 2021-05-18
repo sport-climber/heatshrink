@@ -134,6 +134,34 @@ void heatshrink_encoder_reset(heatshrink_encoder *hse) {
     #endif
 }
 
+/* Copies input data from a buffer into the internal heatshrink encoder
+ * instances sliding window buffer (hse->buffer) center. This is the lookahead
+ * part of the buffer. The data will be shifted backwards towards the beginning
+ * of the actual input buffer by the state machine as its processed.  This is
+ * the lookback portion of the encoder buffer (IE The part that is searched
+ * for back references).
+ *
+ * The state of the look ahead part of the window buffer is kept as state so
+ * that subsequent sink calls will move new data into the free part of the
+ * lookahead window.
+ *
+ * The amount to shift forward is based on the number of bytes that the encoder
+ * has finished processing via the poll. The shifting of the data forward will
+ * continue until all the data has been consumed by the encoder.
+ *
+ * \param[in] hse
+ *     The heatshrink encoder state machine instance.
+ * \param[in] in_buf
+ *     The input buffer to the state machine. This is where the sliding
+ *     window will be adjusted and the leading character dropped.
+ * \param[in] size
+ *     The size is the amount of data to shift forward. This will shift
+ *     up to this size. If the shift would be larger than the input buffer
+ *     the shift will go only to the end of the buffer (remaining bytes).
+ * \param[out] input_size
+ *     A pointer to a size_t type that will indicate the size of the input
+ *     buffer after this process.
+ */
 HSE_sink_res heatshrink_encoder_sink(heatshrink_encoder *hse,
         uint8_t *in_buf, size_t size, size_t *input_size) {
     if ((hse == NULL) || (in_buf == NULL) || (input_size == NULL)) {
@@ -165,6 +193,55 @@ HSE_sink_res heatshrink_encoder_sink(heatshrink_encoder *hse,
     return HSER_SINK_OK;
 }
 
+#if HEATSHRINK_INCLUDE_ZERO_COPY_API
+static inline uint16_t encoder_get_write_buffer_free_space(heatshrink_encoder *hse)
+{
+    uint16_t ibs = get_input_buffer_size(hse);
+    uint16_t rem = ibs - hse->input_size;
+
+    return (rem);
+}
+
+static inline uint8_t * encoder_get_write_buffer(heatshrink_encoder *hse)
+{
+	uint16_t write_offset = get_input_offset(hse) + hse->input_size;
+	return (&hse->buffer[write_offset]);
+}
+/* Function that does the same as heatshrink_encoder_sink() but operates
+ * directly on a file thus, avoiding the buffer copy. */
+#include <unistd.h> //INCLUDE FOR read() below.
+HSE_sink_res heatshrink_encoder_sink_file_read(heatshrink_encoder *hse, int in_fd, size_t *input_size)
+{
+    /* Sinking more content after saying the content is done, tsk tsk */
+    if (is_finishing(hse)) { return HSER_SINK_ERROR_MISUSE; }
+
+    /* Sinking more content before processing is done */
+    if (hse->state != HSES_NOT_FULL) { return HSER_SINK_ERROR_MISUSE; }
+
+    /* Always try to refill the buffer entirely. */
+    uint16_t rem = encoder_get_write_buffer_free_space(hse);
+
+    long int readBytes = read(in_fd, encoder_get_write_buffer(hse), rem);
+    /* Check for errors on reading the file. */
+    if (readBytes < 0)
+    {
+    	/* Error here - */
+    	return HSER_SINK_ERROR_MISUSE;
+    }
+    *input_size = readBytes;
+    hse->input_size += readBytes;
+
+    LOG("-- sunk %u bytes (of %zu) into encoder at %d, input buffer now has %u\n",
+    		readBytes, size, write_offset, hse->input_size);
+    if (readBytes == rem) {
+        LOG("-- internal buffer is now full\n");
+        hse->state = HSES_FILLED;
+    }
+
+    return HSER_SINK_OK;
+}
+#endif //#if HEATSHRINK_INCLUDE_ZERO_COPY_API
+
 
 /***************
  * Compression *
@@ -187,6 +264,24 @@ static HSE_state st_save_backlog(heatshrink_encoder *hse);
 static HSE_state st_flush_bit_buffer(heatshrink_encoder *hse,
     output_info *oi);
 
+/* Implements a state machine that processes the encoder instance buffers
+ * and outputs data to the out_buf.
+ *
+ * \param[in] hse
+ *     The heatshrink encoder structures holding the state including the
+ *     sliding window buffer.
+ * \param[out] out_buf
+ *     The buffer where the encoded (compressed) output from the state
+ *     machine will be written.
+ * \param[in] out_buf_size
+ *     The size of the output buffer where the encoded data will be returned.
+ * \param[out] output_size
+ *     The number of bytes written into the output buffer. ? Will this always
+ *     be flush to the last byte in the buffer? Can symbols be partially stored?
+ *
+ * \return
+ *    The state machine state information.
+ */
 HSE_poll_res heatshrink_encoder_poll(heatshrink_encoder *hse,
         uint8_t *out_buf, size_t out_buf_size, size_t *output_size) {
     if ((hse == NULL) || (out_buf == NULL) || (output_size == NULL)) {

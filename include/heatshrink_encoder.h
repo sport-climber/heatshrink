@@ -90,6 +90,11 @@ void heatshrink_encoder_free(heatshrink_encoder *hse);
 /* Reset an encoder. */
 void heatshrink_encoder_reset(heatshrink_encoder *hse);
 
+#if HEATSHRINK_INCLUDE_ZERO_COPY_API
+HSE_sink_res heatshrink_encoder_sink_file_read(heatshrink_encoder *hse,
+		int in_fd, size_t *input_size);
+#endif
+
 /* Sink up to SIZE bytes from IN_BUF into the encoder.
  * INPUT_SIZE is set to the number of bytes actually sunk (in case a
  * buffer was filled.). */
